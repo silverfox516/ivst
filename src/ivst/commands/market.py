@@ -1,6 +1,12 @@
-"""Market dashboard command."""
+"""Market timing command — Plan §4 `목적 1 수행`.
 
-from typing import Annotated
+`ivst market` builds the US-equity MarketVerdict via
+`analysis/market_service.py` and renders the `[코어]` + `[맥락]` panels.
+The legacy price-quote panel (`build_market_panel`) is preserved as a
+supplementary block and is still exported for `commands/dashboard.py`.
+"""
+
+from __future__ import annotations
 
 import typer
 from rich.columns import Columns
@@ -8,17 +14,25 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
+from ivst.analysis.market_service import (
+    build_us_verdict,
+    fetch_context_indicators,
+)
 from ivst.data.fx import Quote, fetch_all_market_quotes
-from ivst.data.macro import MacroIndicator, fetch_fred_indicators
 from ivst.ui import colors
 from ivst.ui.formatters import fmt_pct
+from ivst.ui.panels import build_context_panel, build_verdict_panel
 
 console = Console()
-market_app = typer.Typer(help="시장 지표 대시보드")
+market_app = typer.Typer(help="시장 타이밍 판정 (목적 1)")
+
+
+# ---------------------------------------------------------------------------
+# Legacy price-quote panel — preserved for commands/dashboard.py.
+# ---------------------------------------------------------------------------
 
 
 def _fmt_quote(q: Quote) -> str:
-    """Format a quote for display."""
     color = colors.PRICE_UP if q.change_pct >= 0 else colors.PRICE_DOWN
 
     if q.name in ("VIX", "10Y UST"):
@@ -38,68 +52,49 @@ def _fmt_quote(q: Quote) -> str:
 
 
 def build_market_panel(quotes: list[Quote]) -> Panel:
-    """Build the market summary panel."""
+    """Price-quote side panel. Kept for dashboard.py compatibility."""
     indices = [q for q in quotes if q.name in ("KOSPI", "KOSDAQ", "S&P 500", "NASDAQ")]
     others = [q for q in quotes if q.name not in ("KOSPI", "KOSDAQ", "S&P 500", "NASDAQ")]
 
-    left_table = Table(show_header=False, box=None, padding=(0, 2))
-    left_table.add_column("항목", width=40)
-
+    left = Table(show_header=False, box=None, padding=(0, 2))
+    left.add_column("항목", width=40)
     for q in indices:
-        left_table.add_row(_fmt_quote(q))
+        left.add_row(_fmt_quote(q))
 
-    right_table = Table(show_header=False, box=None, padding=(0, 2))
-    right_table.add_column("항목", width=40)
-
+    right = Table(show_header=False, box=None, padding=(0, 2))
+    right.add_column("항목", width=40)
     for q in others:
-        right_table.add_row(_fmt_quote(q))
+        right.add_row(_fmt_quote(q))
 
     return Panel(
-        Columns([left_table, right_table], expand=True),
+        Columns([left, right], expand=True),
         title="Market Summary",
         border_style="blue",
     )
 
 
-def build_macro_panel(indicators: list[MacroIndicator]) -> Panel | None:
-    """Build the macro indicators panel."""
-    if not indicators:
-        return None
-
-    table = Table(show_header=True, header_style="bold cyan", expand=True)
-    table.add_column("지표", width=20)
-    table.add_column("값", justify="right", width=12)
-
-    for ind in indicators:
-        table.add_row(ind.name, f"{ind.value:.2f}{ind.unit}")
-
-    return Panel(table, title="경제 지표 (FRED)", border_style="blue")
+# ---------------------------------------------------------------------------
+# Main callback
+# ---------------------------------------------------------------------------
 
 
 @market_app.callback(invoke_without_command=True)
-def market_main(
-    ctx: typer.Context,
-    detail: Annotated[str | None, typer.Argument(help="상세 보기 (liquidity)")] = None,
-) -> None:
-    """시장 지표를 한눈에 보여줍니다."""
-    with console.status("[cyan]시장 데이터 수집 중...[/cyan]"):
-        quotes = fetch_all_market_quotes()
-        macro = fetch_fred_indicators()
-
-    if not quotes:
-        console.print("[red]시장 데이터를 가져올 수 없습니다.[/red]")
-        raise typer.Exit(1)
-
+def market_main(ctx: typer.Context) -> None:
+    """시장 타이밍 판정 (현재 지원: 미국 주식)."""
     console.print()
-    console.print(build_market_panel(quotes))
+    with console.status("[cyan]시장 데이터 수집 중...[/cyan]"):
+        verdict = build_us_verdict()
+        console.print(build_verdict_panel(verdict, "[코어] 미국 주식 시장"))
 
-    macro_panel = build_macro_panel(macro)
-    if macro_panel:
-        console.print(macro_panel)
+    ctx_panel = build_context_panel(fetch_context_indicators())
+    if ctx_panel is not None:
+        console.print(ctx_panel)
 
-    if not macro:
-        console.print(
-            "\n[dim]FRED 경제 지표를 보려면 API 키를 설정하세요: "
-            "~/.config/ivst/fred_api_key[/dim]"
-        )
+    try:
+        quotes = fetch_all_market_quotes()
+    except Exception:
+        quotes = []
+    if quotes:
+        console.print(build_market_panel(quotes))
+
     console.print()

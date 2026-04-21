@@ -1,133 +1,147 @@
-"""Signal command: show buy/sell signals for watchlist stocks."""
+"""Signal command — Plan §4 `목적 2 수행`.
+
+`ivst signal [TICKER]` builds a per-stock StockVerdict and renders it. No
+argument means: analyse the whole watchlist as a summary table.
+
+Market mode (`중장기/스윙/관망`) is derived from `build_us_verdict()` /
+`build_kr_verdict()` depending on whether the watchlist is US-heavy or
+KR-heavy. Each stock verdict then uses mode-specific block weights.
+
+Exports preserved for `commands/dashboard.py`:
+- `signal_app`           — Typer app
+- `generate_all_signals` — now returns list[StockVerdict]
+- `_build_signal_table`  — summary table for a list of StockVerdicts
+- `_signal_style`        — Rich style string for a Signal5 value
+"""
+
+from __future__ import annotations
 
 from typing import Annotated
 
-import numpy as np
 import typer
 from rich.console import Console
-from rich.table import Table
 from rich.panel import Panel
+from rich.table import Table
 
-from ivst.analysis.signal import CompositeSignal, Signal, generate_signal
+from ivst.analysis.market import Mode
+from ivst.analysis.market_service import build_us_verdict
+from ivst.analysis.stock import Signal5, StockVerdict
+from ivst.analysis.stock_service import build_stock_verdict
 from ivst.data.resolver import resolve_ticker
 from ivst.db import repo
-from ivst.ui import colors
-from ivst.ui.formatters import fmt_pct, fmt_price
+from ivst.db.models import WatchItem
+from ivst.ui.panels import build_stock_verdict_panel
 
 console = Console()
-signal_app = typer.Typer(help="매수/매도 시그널 분석")
+signal_app = typer.Typer(help="종목 타이밍 판정 (목적 2)")
 
 
-def _fetch_ohlcv(ticker: str, market: str) -> tuple[np.ndarray, np.ndarray]:
-    """Fetch OHLCV and return (closes, volumes) as numpy arrays."""
-    if market == "KR":
-        from ivst.data.kr_stock import fetch_kr_ohlcv
-        records = fetch_kr_ohlcv(ticker, days=300)
-    else:
-        from ivst.data.us_stock import fetch_us_ohlcv
-        records = fetch_us_ohlcv(ticker, period="1y")
-
-    if not records:
-        return np.array([]), np.array([])
-
-    closes = np.array([r["close"] for r in records])
-    volumes = np.array([r["volume"] for r in records])
-    return closes, volumes
+# ---------------------------------------------------------------------------
+# Rich styling helpers (preserved names for dashboard.py)
+# ---------------------------------------------------------------------------
 
 
-def _signal_style(signal: Signal) -> str:
-    """Return Rich style string for a signal."""
-    return {
-        Signal.STRONG_BUY: colors.STRONG_BUY,
-        Signal.BUY: colors.BUY,
-        Signal.HOLD: colors.HOLD,
-        Signal.SELL: colors.SELL,
-        Signal.STRONG_SELL: colors.STRONG_SELL,
-    }[signal]
+_SIGNAL5_RICH_STYLE: dict[Signal5, str] = {
+    Signal5.STRONG_BUY:  "bold bright_green",
+    Signal5.BUY:         "green",
+    Signal5.HOLD:        "yellow",
+    Signal5.SELL:        "red",
+    Signal5.STRONG_SELL: "bold bright_red",
+}
 
 
-def _build_signal_table(signals: list[CompositeSignal]) -> Panel:
-    """Build a Rich table showing signals for all watchlist stocks."""
+def _signal_style(signal: Signal5) -> str:
+    """Rich style string for a Signal5 value (dashboard compat)."""
+    return _SIGNAL5_RICH_STYLE[signal]
+
+
+# ---------------------------------------------------------------------------
+# Market-mode resolution
+# ---------------------------------------------------------------------------
+
+
+def _resolve_market_mode(items: list[WatchItem]) -> Mode:
+    """Always use the US market verdict's mode — KR market verdict was
+    removed due to unreliable data. KR *stocks* still analyze locally via
+    stock_service, they just don't drive a separate market-level mode.
+    """
+    return build_us_verdict().mode
+
+
+# ---------------------------------------------------------------------------
+# Summary table (dashboard-compatible)
+# ---------------------------------------------------------------------------
+
+
+def _build_signal_table(verdicts: list[StockVerdict]) -> Panel:
+    """Compact summary table for a list of StockVerdicts."""
     table = Table(show_header=True, header_style="bold cyan", expand=True)
-    table.add_column("종목", width=16)
-    table.add_column("현재가", justify="right", width=14)
-    table.add_column("등락", justify="right", width=10)
-    table.add_column("시그널", justify="center", width=14)
-    table.add_column("신뢰도", justify="right", width=10)
+    table.add_column("종목", width=24)
+    table.add_column("모드", width=8)
+    table.add_column("신호", justify="center", width=14)
+    table.add_column("총점", justify="right", width=8)
+    table.add_column("블록 점수 (V/E/T/S)", width=26)
 
-    for sig in signals:
-        price_style = colors.PRICE_UP if sig.price_change_pct >= 0 else colors.PRICE_DOWN
-        sig_style = _signal_style(sig.signal)
-
+    for v in verdicts:
+        style = _signal_style(v.signal)
+        scores = {b.code: b.block_score for b in v.blocks}
+        per_block = (
+            f"V {scores.get('VALUE',  0.0):+.1f} "
+            f"E {scores.get('EVENT',  0.0):+.1f} "
+            f"T {scores.get('TREND',  0.0):+.1f} "
+            f"S {scores.get('SECTOR', 0.0):+.1f}"
+        )
+        warn = "⚠ " if v.mode_mismatch_warning else ""
         table.add_row(
-            f"{sig.name}",
-            f"[{price_style}]{fmt_price(sig.current_price, sig.market)}[/]",
-            f"[{price_style}]{fmt_pct(sig.price_change_pct)}[/]",
-            f"[{sig_style}]{sig.signal.value}[/]",
-            f"{sig.confidence:.0f}%",
+            f"{v.name} ({v.ticker})",
+            v.mode.value,
+            f"[{style}]{warn}{v.signal.value}[/]",
+            f"{v.total_score:+.2f}",
+            per_block,
         )
 
     return Panel(table, title="Watchlist Signals", border_style="blue")
 
 
-def _build_detail_panel(sig: CompositeSignal) -> Panel:
-    """Build a detail panel for one stock showing all indicators."""
-    table = Table(show_header=True, header_style="bold cyan", expand=True)
-    table.add_column("지표", width=14)
-    table.add_column("신호", justify="center", width=10)
-    table.add_column("강도", justify="right", width=10)
-    table.add_column("상세", width=40)
-
-    for ind in sig.indicators:
-        dir_text = {1: "[green]BUY[/]", -1: "[red]SELL[/]", 0: "[yellow]HOLD[/]"}[
-            ind.direction.value
-        ]
-        table.add_row(
-            ind.name,
-            dir_text,
-            f"{ind.strength:.0%}",
-            ind.detail,
-        )
-
-    sig_style = _signal_style(sig.signal)
-    price_style = colors.PRICE_UP if sig.price_change_pct >= 0 else colors.PRICE_DOWN
-
-    header = (
-        f"[bold]{sig.name}[/bold] ({sig.ticker}) | "
-        f"[{price_style}]{fmt_price(sig.current_price, sig.market)} "
-        f"({fmt_pct(sig.price_change_pct)})[/] | "
-        f"[{sig_style}]{sig.signal.value}[/] (신뢰도 {sig.confidence:.0f}%)"
-    )
-
-    return Panel(table, title=header, border_style="blue")
+# ---------------------------------------------------------------------------
+# Public worker
+# ---------------------------------------------------------------------------
 
 
-def generate_all_signals() -> list[CompositeSignal]:
-    """Generate signals for all watchlist stocks."""
+def generate_all_signals() -> list[StockVerdict]:
+    """Build a StockVerdict for every watchlist item.
+
+    Individual failures are logged at dim severity and skipped so the rest
+    of the list still renders.
+    """
     items = repo.watchlist_list()
-    signals = []
+    if not items:
+        return []
+
+    mode = _resolve_market_mode(items)
+    verdicts: list[StockVerdict] = []
 
     for item in items:
         try:
-            closes, volumes = _fetch_ohlcv(item.ticker, item.market)
-            if len(closes) == 0:
-                continue
-            sig = generate_signal(
-                item.ticker, item.name, item.market, closes, volumes
+            verdicts.append(
+                build_stock_verdict(item.ticker, item.name, item.market, mode)
             )
-            signals.append(sig)
         except Exception as e:
-            console.print(f"[dim]{item.name}: 데이터 수집 실패 ({e})[/dim]")
+            console.print(f"[dim]{item.name}: 판정 실패 ({e})[/dim]")
+    return verdicts
 
-    return signals
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
 
 
 @signal_app.callback(invoke_without_command=True)
 def signal_main(
     ctx: typer.Context,
-    ticker: Annotated[str | None, typer.Argument(help="종목코드 (없으면 전체 관심종목)")] = None,
+    ticker: Annotated[str | None, typer.Argument(help="종목코드 (비우면 전체 관심종목)")] = None,
 ) -> None:
-    """관심종목의 매수/매도 시그널을 분석합니다."""
+    """종목 매수/매도 판정."""
     if ticker:
         matches = resolve_ticker(ticker)
         if not matches:
@@ -135,29 +149,31 @@ def signal_main(
             raise typer.Exit(1)
 
         info = matches[0]
-        with console.status(f"[cyan]{info.name} 분석 중...[/cyan]"):
-            closes, volumes = _fetch_ohlcv(info.ticker, info.market)
-            if len(closes) == 0:
-                console.print(f"[red]{info.name}: 가격 데이터 없음[/red]")
-                raise typer.Exit(1)
+        watchlist = repo.watchlist_list()
+        mode = _resolve_market_mode(watchlist)
 
-            sig = generate_signal(
-                info.ticker, info.name, info.market, closes, volumes
-            )
+        with console.status(f"[cyan]{info.name} 분석 중 (모드: {mode.value})...[/cyan]"):
+            verdict = build_stock_verdict(info.ticker, info.name, info.market, mode)
 
         console.print()
-        console.print(_build_detail_panel(sig))
+        console.print(build_stock_verdict_panel(verdict))
         console.print()
-    else:
-        items = repo.watchlist_list()
-        if not items:
-            console.print("[dim]관심종목이 없습니다. ivst watch add <종목> 으로 추가하세요.[/dim]")
-            raise typer.Exit()
+        return
 
-        with console.status("[cyan]관심종목 분석 중...[/cyan]"):
-            signals = generate_all_signals()
+    items = repo.watchlist_list()
+    if not items:
+        console.print(
+            "[dim]관심종목이 없습니다. ivst watch add <종목> 으로 추가하세요.[/dim]"
+        )
+        raise typer.Exit()
 
-        if signals:
-            console.print()
-            console.print(_build_signal_table(signals))
-            console.print()
+    with console.status("[cyan]관심종목 분석 중...[/cyan]"):
+        verdicts = generate_all_signals()
+
+    if not verdicts:
+        console.print("[red]분석 가능한 종목이 없습니다.[/red]")
+        raise typer.Exit(1)
+
+    console.print()
+    console.print(_build_signal_table(verdicts))
+    console.print()

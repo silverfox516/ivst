@@ -9,5 +9,5 @@ wheels/
 # Virtual environments
 .venv
 
-# Local data
-data/
+# Local runtime data (SQLite cache etc.) — root only, not src/ivst/data/
+/data/
