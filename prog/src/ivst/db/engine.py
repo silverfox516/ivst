@@ -63,6 +63,12 @@ CREATE TABLE IF NOT EXISTS news_cache (
     published_at TEXT,
     fetched_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+CREATE TABLE IF NOT EXISTS screening_cache (
+    key TEXT PRIMARY KEY,
+    payload TEXT NOT NULL,
+    cached_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
 """
 
 

@@ -16,15 +16,18 @@ recommend_app = typer.Typer(help="유망 종목 추천")
 
 
 def build_recommend_panel(
-    recs: list[Recommendation], show_reason: bool = False
+    recs: list[Recommendation],
+    show_reason: bool = False,
+    mode: str = "balanced",
 ) -> Panel:
     """Build recommendation table panel."""
     table = Table(show_header=True, header_style="bold cyan", expand=True)
     table.add_column("#", width=4, style="dim")
     table.add_column("종목", width=20)
     table.add_column("섹터", width=16)
-    table.add_column("모멘텀", justify="right", width=10)
-    table.add_column("정책", justify="center", width=8)
+    table.add_column("점수", justify="right", width=10)
+    table.add_column("정책", justify="center", width=6)
+    table.add_column("주의", width=22, style=colors.BEARISH)
 
     if show_reason:
         table.add_column("추천 근거", width=50)
@@ -32,14 +35,23 @@ def build_recommend_panel(
     for i, rec in enumerate(recs, 1):
         policy_str = f"[{colors.BULLISH}]O[/]" if rec.policy_match else ""
         score_str = f"{rec.momentum_score:+.1f}"
+        warn_str = " ".join(rec.warnings) if rec.warnings else ""
 
-        row = [str(i), f"{rec.name} ({rec.ticker})", rec.sector, score_str, policy_str]
+        row = [
+            str(i),
+            f"{rec.name} ({rec.ticker})",
+            rec.sector,
+            score_str,
+            policy_str,
+            warn_str,
+        ]
         if show_reason:
             row.append(rec.reason)
 
         table.add_row(*row)
 
-    return Panel(table, title="추천 종목", border_style="green")
+    title = f"추천 종목 · mode={mode}"
+    return Panel(table, title=title, border_style="green")
 
 
 @recommend_app.callback(invoke_without_command=True)
@@ -47,13 +59,30 @@ def recommend_main(
     ctx: typer.Context,
     reason: Annotated[bool, typer.Option("--reason", help="추천 근거 표시")] = False,
     market: Annotated[str, typer.Option("--market", help="시장 (KR/US/ALL)")] = "ALL",
+    mode: Annotated[
+        str,
+        typer.Option(
+            "--mode",
+            help="스크리닝 모드: momentum (추격), value (저평가), balanced (기본·과열 페널티)",
+        ),
+    ] = "balanced",
 ) -> None:
     """섹터 모멘텀과 정책 수혜를 분석하여 유망 종목을 추천합니다."""
-    with console.status("[cyan]섹터 분석 및 종목 추천 중...[/cyan]"):
+    mode_norm = mode.lower()
+    if mode_norm not in {"momentum", "value", "balanced"}:
+        console.print(
+            f"[red]알 수 없는 mode: {mode!r}. momentum/value/balanced 중 하나여야 합니다.[/red]"
+        )
+        raise typer.Exit(code=2)
+
+    with console.status(f"[cyan]섹터 분석 및 종목 추천 중... (mode={mode_norm})[/cyan]"):
         news = fetch_all_news(limit=30)
         news_texts = [n.title + " " + n.summary for n in news]
         recs = generate_recommendations(
-            news_texts=news_texts, market=market.upper(), top_n=8
+            news_texts=news_texts,
+            market=market.upper(),
+            top_n=8,
+            mode=mode_norm,  # type: ignore[arg-type]
         )
 
     if not recs:
@@ -61,5 +90,5 @@ def recommend_main(
         raise typer.Exit()
 
     console.print()
-    console.print(build_recommend_panel(recs, show_reason=reason))
+    console.print(build_recommend_panel(recs, show_reason=reason, mode=mode_norm))
     console.print()

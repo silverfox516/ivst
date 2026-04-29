@@ -4,6 +4,8 @@ from dataclasses import dataclass
 
 import yfinance as yf
 
+from ivst.analysis.discovery import ScoredKRCandidate, ScreenMode, screen_kr_market
+
 
 @dataclass(frozen=True)
 class SectorScore:
@@ -23,6 +25,7 @@ class Recommendation:
     momentum_score: float
     policy_match: bool
     reason: str
+    warnings: tuple[str, ...] = ()
 
 
 # Sector ETF mappings
@@ -34,7 +37,7 @@ KR_SECTOR_ETFS = {
     "은행": "091170.KS",         # KODEX 은행
     "철강": "117680.KS",         # KODEX 철강
     "건설": "117700.KS",         # KODEX 건설
-    "IT": "098560.KS",           # KODEX IT
+    "IT": "139260.KS",           # TIGER 200 IT (KODEX IT 098560 상폐 대체)
 }
 
 US_SECTOR_ETFS = {
@@ -146,14 +149,79 @@ def detect_policy_sectors(news_texts: list[str]) -> set[str]:
     return boosted
 
 
-def generate_recommendations(
-    news_texts: list[str] | None = None,
-    market: str = "ALL",
-    top_n: int = 8,
+# Policy-sector vocabulary (`POLICY_SECTOR_MAP` values) → KRX 업종명 substrings.
+# KRX classifies semiconductors under "전기·전자", banks under "기타금융", etc.,
+# so substring match against the raw policy token alone misses most cases.
+_POLICY_TO_KRX_SECTOR = {
+    "반도체": ("전기·전자", "전기전자"),
+    "IT": ("서비스", "통신", "전기·전자"),
+    "2차전지": ("화학", "전기·전자"),
+    "자동차": ("운수장비", "자동차"),
+    "건설": ("건설",),
+    "은행": ("금융", "은행"),
+    "바이오": ("의약품", "바이오"),
+    "방산": ("운수장비", "기계"),
+}
+
+
+def _policy_boost_kr(sc: ScoredKRCandidate, policy_sectors: set[str]) -> tuple[float, bool]:
+    """Apply 1.3x boost when KRX 업종명 or 종목명 maps to a policy sector token."""
+    if not policy_sectors:
+        return sc.score, False
+    haystack = f"{sc.base.sector} {sc.base.name}".lower()
+    for token in policy_sectors:
+        token_lc = token.lower()
+        if token_lc in haystack:
+            return sc.score * 1.3, True
+        for krx_term in _POLICY_TO_KRX_SECTOR.get(token, ()):
+            if krx_term.lower() in haystack:
+                return sc.score * 1.3, True
+    return sc.score, False
+
+
+def _kr_recommendations_dynamic(
+    policy_sectors: set[str],
+    top_n: int,
+    mode: ScreenMode,
 ) -> list[Recommendation]:
-    """Generate stock recommendations based on sector momentum and policy."""
-    sectors = score_sectors(market)
-    policy_sectors = detect_policy_sectors(news_texts or [])
+    """Build KR recommendations from a live whole-market screen."""
+    candidates = screen_kr_market(top_n=max(top_n * 3, 20), mode=mode)
+    if not candidates:
+        return []
+
+    boosted: list[tuple[ScoredKRCandidate, float, bool]] = [
+        (sc, *_policy_boost_kr(sc, policy_sectors)) for sc in candidates
+    ]
+    boosted.sort(key=lambda x: x[1], reverse=True)
+
+    recs: list[Recommendation] = []
+    for sc, score, policy in boosted[:top_n]:
+        c = sc.base
+        policy_text = ", 정책 수혜" if policy else ""
+        reason = (
+            f"{c.sector} | 1M {c.return_1m:+.1f}% / 3M {c.return_3m:+.1f}% "
+            f"| PER {c.per:.1f} PBR {c.pbr:.1f}{policy_text}"
+        )
+        recs.append(Recommendation(
+            ticker=c.ticker,
+            name=c.name,
+            sector=c.sector,
+            momentum_score=score,
+            policy_match=policy,
+            reason=reason,
+            warnings=sc.warnings,
+        ))
+    return recs
+
+
+def _us_recommendations_static(
+    policy_sectors: set[str],
+    top_n: int,
+) -> list[Recommendation]:
+    """Existing static US path: sector ETF momentum + hardcoded representatives."""
+    sectors = score_sectors("US")
+    if not sectors:
+        return []
 
     for i, s in enumerate(sectors):
         if s.name in policy_sectors:
@@ -169,18 +237,15 @@ def generate_recommendations(
     sectors.sort(key=lambda s: s.momentum_score, reverse=True)
     top_sectors = sectors[:5]
 
-    stock_map = {**KR_SECTOR_STOCKS, **US_SECTOR_STOCKS}
-    recommendations = []
-
+    recs: list[Recommendation] = []
     for sector in top_sectors:
-        stocks = stock_map.get(sector.name, [])
-        for ticker, name in stocks[:2]:
+        for ticker, name in US_SECTOR_STOCKS.get(sector.name, [])[:2]:
             policy_text = ", 정책 수혜" if sector.policy_boost else ""
             reason = (
                 f"{sector.name} 섹터 1개월 {sector.return_1m:+.1f}%, "
                 f"3개월 {sector.return_3m:+.1f}% (모멘텀 상위){policy_text}"
             )
-            recommendations.append(Recommendation(
+            recs.append(Recommendation(
                 ticker=ticker,
                 name=name,
                 sector=sector.name,
@@ -188,6 +253,34 @@ def generate_recommendations(
                 policy_match=sector.policy_boost,
                 reason=reason,
             ))
+    return recs[:top_n]
 
-    recommendations.sort(key=lambda r: r.momentum_score, reverse=True)
-    return recommendations[:top_n]
+
+def generate_recommendations(
+    news_texts: list[str] | None = None,
+    market: str = "ALL",
+    top_n: int = 8,
+    mode: ScreenMode = "balanced",
+) -> list[Recommendation]:
+    """Generate stock recommendations.
+
+    KR side uses live KRX whole-market screening with the requested mode
+    (`momentum` / `value` / `balanced`). US side keeps the sector-ETF +
+    representatives approach until a US screener is added; `mode` does
+    not affect the US slate.
+    """
+    policy_sectors = detect_policy_sectors(news_texts or [])
+    market_u = market.upper()
+
+    if market_u == "KR":
+        return _kr_recommendations_dynamic(policy_sectors, top_n, mode)
+    if market_u == "US":
+        return _us_recommendations_static(policy_sectors, top_n)
+
+    # ALL: split slots so KR per-stock momentum doesn't crowd out US ETF picks,
+    # which sit on a much smaller numeric scale.
+    kr_slots = top_n // 2
+    us_slots = top_n - kr_slots
+    kr = _kr_recommendations_dynamic(policy_sectors, kr_slots, mode)
+    us = _us_recommendations_static(policy_sectors, us_slots)
+    return kr + us
